@@ -1,0 +1,1203 @@
+openapi: 3.1.0
+info:
+  title: API Pasaree — ChefGenie
+  version: 1.0.0
+  description: |
+    Kontrak API layanan Pasaree (marketplace lapak terkurasi) v1.0.0.
+
+    Sumber: `produk/20-kontrak-api-KMP-mobile.md` dan `produk/21-kontrak-api-web-bun.md`
+    di Pasaree-TownHall, serta aturan keuangan `platform/versions/v1.0.0/BRD/30-keuangan-komisi.md`.
+    Endpoint `/auth/*` diturunkan dari model JWT divisi (akses 15 menit, refresh 7 hari
+    dengan reuse-detection), karena kontrak living belum merinci login/refresh.
+
+    Aturan utama:
+    - Uang selalu integer IDR (tanpa sen). Komisi dibulatkan ke bawah (`floor()`) per baris.
+    - Komisi 8% (paket-hampers 10%, lapak baru 5% selama 30 hari) dipotong dari payout
+      lapak, bukan dari pembeli. Biaya layanan Rp2.000 per checkout masuk operasional Pasaree.
+    - Ongkir 100% diteruskan ke kas trip Lumbung. Fulfillment wajib via trip Lumbung.
+    - Katalog jujur: harga tampil = harga bayar sebelum ongkir.
+    - JWT wajib berklaim `aud: pasaree`. ID memakai ULID string; waktu ISO-8601 UTC.
+  contact:
+    name: Divisi Pasaree — Coding-Skuy
+servers:
+  - url: https://api.pasaree.chefgenie.id/v1
+    description: Produksi (placeholder resmi)
+  - url: http://localhost:8080
+    description: Lokal
+tags:
+  - name: Auth
+    description: Login dan perpanjangan token (audiens `pasaree`).
+  - name: Katalog
+    description: Baca katalog produk dan lapak (auth opsional).
+  - name: Keranjang
+    description: Keranjang pembeli.
+  - name: Checkout
+    description: Pratinjau dan pembuatan pesanan.
+  - name: Pesanan
+    description: Pembayaran, status, konfirmasi terima, ulasan.
+  - name: Trip
+    description: Jadwal trip Lumbung (proksi baca, cache 60 detik).
+  - name: Web Lapak
+    description: Lapak, draf produk, stok, harga, pesanan masuk (peran produsen/operator).
+  - name: Web Kurasi
+    description: Antrean dan keputusan kurasi (peran kurator/admin).
+  - name: Web Admin
+    description: Pengaturan komisi (peran admin).
+security:
+  - bearerAuth: []
+paths:
+  /auth/login:
+    post:
+      operationId: postAuthLogin
+      tags: [Auth]
+      summary: Masuk dan terima token akses + refresh
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LoginRequest'
+      responses:
+        '200':
+          description: Token diterbitkan (akses 15 menit, refresh 7 hari).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TokenResponse'
+        '400': { $ref: '#/components/responses/Error400' }
+        '401': { $ref: '#/components/responses/Error401' }
+        '422': { $ref: '#/components/responses/Error422' }
+        '500': { $ref: '#/components/responses/Error500' }
+  /auth/refresh:
+    post:
+      operationId: postAuthRefresh
+      tags: [Auth]
+      summary: Perpanjang token (refresh dengan reuse-detection)
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RefreshRequest'
+      responses:
+        '200':
+          description: Pasangan token baru; refresh lama tidak berlaku lagi.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TokenResponse'
+        '401': { $ref: '#/components/responses/Error401' }
+        '422': { $ref: '#/components/responses/Error422' }
+        '500': { $ref: '#/components/responses/Error500' }
+  /katalog/produk:
+    get:
+      operationId: getKatalogProduk
+      tags: [Katalog]
+      summary: Daftar produk tayang
+      security: [{}, { bearerAuth: [] }]
+      parameters:
+        - { name: q, in: query, schema: { type: string } }
+        - name: kategori
+          in: query
+          schema: { $ref: '#/components/schemas/KategoriKode' }
+        - name: tag
+          in: query
+          schema: { $ref: '#/components/schemas/Tag' }
+        - { name: lapak_slug, in: query, schema: { type: string } }
+        - name: sort
+          in: query
+          schema: { type: string, enum: [harga_asc, harga_desc, rating, terbaru] }
+        - { $ref: '#/components/parameters/Limit' }
+        - { $ref: '#/components/parameters/Cursor' }
+      responses:
+        '200':
+          description: Halaman produk.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data, cursor_lanjut, harga_berubah]
+                properties:
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/ProdukRingkas' }
+                  cursor_lanjut: { type: [string, 'null'] }
+                  harga_berubah: { type: boolean }
+        '400': { $ref: '#/components/responses/Error400' }
+        '500': { $ref: '#/components/responses/Error500' }
+  /katalog/produk/{id}:
+    get:
+      operationId: getKatalogProdukId
+      tags: [Katalog]
+      summary: Detail produk tayang
+      security: [{}, { bearerAuth: [] }]
+      parameters:
+        - { $ref: '#/components/parameters/IdPath' }
+      responses:
+        '200':
+          description: Produk penuh dengan stok per varian dan trip tersedia.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ProdukTayang' }
+        '404': { $ref: '#/components/responses/Error404' }
+        '500': { $ref: '#/components/responses/Error500' }
+  /katalog/lapak/{slug}:
+    get:
+      operationId: getKatalogLapakSlug
+      tags: [Katalog]
+      summary: Profil lapak + produk tayang + skor fulfillment
+      security: [{}, { bearerAuth: [] }]
+      parameters:
+        - { name: slug, in: path, required: true, schema: { type: string, pattern: '^[a-z0-9-]{3,60}$' } }
+      responses:
+        '200':
+          description: Profil lapak.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ProfilLapak' }
+        '404': { $ref: '#/components/responses/Error404' }
+        '500': { $ref: '#/components/responses/Error500' }
+  /keranjang:
+    put:
+      operationId: putKeranjang
+      tags: [Keranjang]
+      summary: Ubah qty varian di keranjang (qty 0 = hapus)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/KeranjangUbah' }
+      responses:
+        '200':
+          description: Keranjang terhitung.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Keranjang' }
+        '401': { $ref: '#/components/responses/Error401' }
+        '404': { $ref: '#/components/responses/Error404' }
+        '409': { $ref: '#/components/responses/Error409' }
+        '422': { $ref: '#/components/responses/Error422' }
+        '500': { $ref: '#/components/responses/Error500' }
+  /checkout/pratinjau:
+    post:
+      operationId: postCheckoutPratinjau
+      tags: [Checkout]
+      summary: Hitung total dari server (klien tidak boleh menghitung sendiri)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CheckoutRequest' }
+      responses:
+        '200':
+          description: Pratinjau; stok dikunci hingga `kunci_stok_hingga`.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PratinjauCheckout' }
+        '401': { $ref: '#/components/responses/Error401' }
+        '409':
+          description: Stok atau harga berubah (`STOK_HABIS`, `HARGA_BERUBAH`, `TRIP_PENUH`); klien wajib menampilkan ulang pratinjau.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '422': { $ref: '#/components/responses/Error422' }
+        '500': { $ref: '#/components/responses/Error500' }
+  /pesanan:
+    post:
+      operationId: postPesanan
+      tags: [Checkout]
+      summary: Buat pesanan dari pratinjau
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/PesananBuat' }
+      responses:
+        '201':
+          description: Pesanan dibuat berstatus DIPESAN; batas bayar 30 menit.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [pesanan_id, batas_bayar_hingga, total_idr]
+                properties:
+                  pesanan_id: { type: string, examples: ['PSR-01J0000000000000000000001'] }
+                  batas_bayar_hingga: { type: string, format: date-time }
+                  total_idr: { $ref: '#/components/schemas/Idr' }
+        '401': { $ref: '#/components/responses/Error401' }
+        '409': { $ref: '#/components/responses/Error409' }
+        '422': { $ref: '#/components/responses/Error422' }
+        '500': { $ref: '#/components/responses/Error500' }
+    get:
+      operationId: getPesanan
+      tags: [Pesanan]
+      summary: Daftar pesanan pembeli
+      parameters:
+        - name: status
+          in: query
+          schema: { $ref: '#/components/schemas/StatusPesanan' }
+        - { $ref: '#/components/parameters/Limit' }
+        - { $ref: '#/components/parameters/Cursor' }
+      responses:
+        '200':
+          description: Ringkasan pesanan.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data, cursor_lanjut]
+                properties:
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/PesananRingkas' }
+                  cursor_lanjut: { type: [string, 'null'] }
+        '401': { $ref: '#/components/responses/Error401' }
+        '500': { $ref: '#/components/responses/Error500' }
+  /pesanan/{id}:
+    get:
+      operationId: getPesananId
+      tags: [Pesanan]
+      summary: Detail pesanan + timeline + aksi tersedia
+      parameters:
+        - { $ref: '#/components/parameters/IdPath' }
+      responses:
+        '200':
+          description: Detail pesanan.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PesananDetail' }
+        '401': { $ref: '#/components/responses/Error401' }
+        '404': { $ref: '#/components/responses/Error404' }
+        '500': { $ref: '#/components/responses/Error500' }
+  /pesanan/{id}/bayar:
+    post:
+      operationId: postPesananIdBayar
+      tags: [Pesanan]
+      summary: Bayar pesanan (idempoten)
+      description: Kirim ulang dengan `idempotency_key` sama menghasilkan respons identik tanpa tagihan ganda. Dana ditahan kasir Pasaree dengan `escrow_id` hingga serah-terima trip.
+      parameters:
+        - { $ref: '#/components/parameters/IdPath' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/BayarRequest' }
+      responses:
+        '200':
+          description: Pesanan DIBAYAR.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status, escrow_id]
+                properties:
+                  status: { type: string, const: DIBAYAR }
+                  escrow_id: { type: string, examples: ['ESC-01J0000000000000000000001'] }
+        '401': { $ref: '#/components/responses/Error401' }
+        '404': { $ref: '#/components/responses/Error404' }
+        '409': { $ref: '#/components/responses/Error409' }
+        '422': { $ref: '#/components/responses/Error422' }
+        '500': { $ref: '#/components/responses/Error500' }
+  /pesanan/{id}/konfirmasi-terima:
+    post:
+      operationId: postPesananIdKonfirmasiTerima
+      tags: [Pesanan]
+      summary: Pembeli mengonfirmasi terima (melepas escrow ke payout)
+      parameters:
+        - { $ref: '#/components/parameters/IdPath' }
+      responses:
+        '200':
+          description: SELESAI, atau DITERIMA_PEMBELI bila ada sub-pesanan lain belum selesai.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status]
+                properties:
+                  status: { type: string, enum: [SELESAI, DITERIMA_PEMBELI] }
+        '401': { $ref: '#/components/responses/Error401' }
+        '404': { $ref: '#/components/responses/Error404' }
+        '409': { $ref: '#/components/responses/Error409' }
+        '500': { $ref: '#/components/responses/Error500' }
+  /ulasan:
+    post:
+      operationId: postUlasan
+      tags: [Pesanan]
+      summary: Beri ulasan (1 per produk per pesanan, maksimal 7 hari setelah selesai)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/UlasanBuat' }
+      responses:
+        '201':
+          description: Ulasan tersimpan.
+        '401': { $ref: '#/components/responses/Error401' }
+        '404': { $ref: '#/components/responses/Error404' }
+        '409': { $ref: '#/components/responses/Error409' }
+        '422': { $ref: '#/components/responses/Error422' }
+        '500': { $ref: '#/components/responses/Error500' }
+  /trip:
+    get:
+      operationId: getTrip
+      tags: [Trip]
+      summary: Jadwal trip Lumbung (proksi, cache 60 detik)
+      description: 'Bila Lumbung tidak merespons, kembalikan cache terakhir dengan `basi: true`. Checkout tanpa trip valid diblokir.'
+      parameters:
+        - { name: dari, in: query, schema: { type: string, format: date-time } }
+        - { name: sampai, in: query, schema: { type: string, format: date-time } }
+        - { name: titik_id, in: query, schema: { type: string } }
+      responses:
+        '200':
+          description: Daftar trip.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data, basi]
+                properties:
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/TripLumbung' }
+                  basi: { type: boolean }
+        '401': { $ref: '#/components/responses/Error401' }
+        '500': { $ref: '#/components/responses/Error500' }
+  /web/lapak-saya:
+    get:
+      operationId: getWebLapakSaya
+      tags: [Web Lapak]
+      summary: Lapak milik akun
+      responses:
+        '200':
+          description: Daftar lapak.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/LapakSaya' }
+        '401': { $ref: '#/components/responses/Error401' }
+        '500': { $ref: '#/components/responses/Error500' }
+  /web/lapak/{id}:
+    patch:
+      operationId: patchWebLapakId
+      tags: [Web Lapak]
+      summary: Ubah profil lapak (slug tidak dapat diubah)
+      parameters:
+        - { $ref: '#/components/parameters/IdPath' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                nama_lapak: { type: string, minLength: 3, maxLength: 60 }
+                deskripsi: { type: string, minLength: 50, maxLength: 500 }
+                titik_serah_lumbung_id: { type: string }
+              additionalProperties: false
+      responses:
+        '200':
+          description: Lapak terbaru.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/LapakSaya' }
+        '401': { $ref: '#/components/responses/Error401' }
+        '404': { $ref: '#/components/responses/Error404' }
+        '422': { $ref: '#/components/responses/Error422' }
+        '500': { $ref: '#/components/responses/Error500' }
+  /web/produk:
+    get:
+      operationId: getWebProduk
+      tags: [Web Lapak]
+      summary: Daftar produk lapak (semua status)
+      parameters:
+        - name: status
+          in: query
+          schema: { $ref: '#/components/schemas/ProdukStatus' }
+        - { name: lapak_id, in: query, schema: { type: string } }
+        - { $ref: '#/components/parameters/Limit' }
+        - { $ref: '#/components/parameters/Cursor' }
+      responses:
+        '200':
+          description: Daftar produk + catatan revisi bila ada.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data, cursor_lanjut]
+                properties:
+                  data:
+                    type: array
+                    items:
+                      type: object
+                      required: [id, judul, status]
+                      properties:
+                        id: { type: string }
+                        judul: { type: string }
+                        status: { $ref: '#/components/schemas/ProdukStatus' }
+                        perlu_revisi_catatan: { type: [string, 'null'] }
+                  cursor_lanjut: { type: [string, 'null'] }
+        '401': { $ref: '#/components/responses/Error401' }
+        '500': { $ref: '#/components/responses/Error500' }
+  /web/produk/draf:
+    post:
+      operationId: postWebProdukDraf
+      tags: [Web Lapak]
+      summary: Buat draf produk
+      parameters:
+        - { $ref: '#/components/parameters/IdempotencyKey' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/DrafProdukPayload' }
+      responses:
+        '201':
+          description: Draf dibuat.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [produk_id, status]
+                properties:
+                  produk_id: { type: string }
+                  status: { type: string, const: DRAF }
+        '401': { $ref: '#/components/responses/Error401' }
+        '422': { $ref: '#/components/responses/Error422' }
+        '500': { $ref: '#/components/responses/Error500' }
+  /web/produk/{id}:
+    put:
+      operationId: putWebProdukId
+      tags: [Web Lapak]
+      summary: Ubah draf (field, varian, media) dan jalankan cek otomatis
+      parameters:
+        - { $ref: '#/components/parameters/IdPath' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                judul: { type: string, minLength: 10, maxLength: 80 }
+                deskripsi: { type: string, minLength: 50, maxLength: 2000 }
+                tag:
+                  type: array
+                  maxItems: 2
+                  items: { $ref: '#/components/schemas/Tag' }
+                komposisi: { type: [string, 'null'] }
+                alergen: { type: array, items: { type: string } }
+                varian:
+                  type: array
+                  items: { $ref: '#/components/schemas/VarianProduk' }
+                media:
+                  type: array
+                  maxItems: 7
+                  items: { $ref: '#/components/schemas/MediaProduk' }
+      responses:
+        '200':
+          description: Produk + hasil cek otomatis.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [produk_id, cek_otomatis]
+                properties:
+                  produk_id: { type: string }
+                  cek_otomatis: { $ref: '#/components/schemas/CekOtomatis' }
+        '401': { $ref: '#/components/responses/Error401' }
+        '404': { $ref: '#/components/responses/Error404' }
+        '422': { $ref: '#/components/responses/Error422' }
+        '500': { $ref: '#/components/responses/Error500' }
+  /web/produk/{id}/ajukan-kurasi:
+    post:
+      operationId: postWebProdukIdAjukanKurasi
+      tags: [Web Lapak]
+      summary: Ajukan kurasi (status MENUNGGU_KURASI)
+      parameters:
+        - { $ref: '#/components/parameters/IdPath' }
+      responses:
+        '200':
+          description: Menunggu kurasi; SLA 2x24 jam kerja.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status, estimasi_sla]
+                properties:
+                  status: { type: string, const: MENUNGGU_KURASI }
+                  estimasi_sla: { type: string, format: date-time }
+        '401': { $ref: '#/components/responses/Error401' }
+        '404': { $ref: '#/components/responses/Error404' }
+        '422':
+          description: Cek otomatis gagal.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '500': { $ref: '#/components/responses/Error500' }
+  /web/media/presigned:
+    post:
+      operationId: postWebMediaPresigned
+      tags: [Web Lapak]
+      summary: Minta URL unggah presigned (foto <=5 MB, video <=50 MB)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [nama_berkas, tipe_mime, ukuran_byte]
+              properties:
+                nama_berkas: { type: string }
+                tipe_mime: { type: string, examples: ['image/jpeg'] }
+                ukuran_byte: { type: integer, minimum: 1, maximum: 52428800 }
+      responses:
+        '200':
+          description: URL unggah.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [unggah_url, media_url, kedaluwarsa]
+                properties:
+                  unggah_url: { type: string, format: uri }
+                  media_url: { type: string, format: uri }
+                  kedaluwarsa: { type: string, format: date-time }
+        '401': { $ref: '#/components/responses/Error401' }
+        '422': { $ref: '#/components/responses/Error422' }
+        '500': { $ref: '#/components/responses/Error500' }
+  /web/varian/{id}/stok:
+    patch:
+      operationId: patchWebVarianIdStok
+      tags: [Web Lapak]
+      summary: Ubah stok varian
+      parameters:
+        - { $ref: '#/components/parameters/IdPath' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [stok, alasan]
+              properties:
+                stok: { type: integer, minimum: 0 }
+                alasan: { type: string }
+      responses:
+        '200':
+          description: Stok baru; produk NONAKTIF_STOK_0 kembali TAYANG bila stok >0.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [stok, status_produk]
+                properties:
+                  stok: { type: integer, minimum: 0 }
+                  status_produk: { $ref: '#/components/schemas/ProdukStatus' }
+        '401': { $ref: '#/components/responses/Error401' }
+        '404': { $ref: '#/components/responses/Error404' }
+        '422': { $ref: '#/components/responses/Error422' }
+        '500': { $ref: '#/components/responses/Error500' }
+  /web/varian/{id}/harga:
+    patch:
+      operationId: patchWebVarianIdHarga
+      tags: [Web Lapak]
+      summary: Ubah harga varian (kenaikan >20% memicu kurasi ulang ringan)
+      parameters:
+        - { $ref: '#/components/parameters/IdPath' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [harga_idr]
+              properties:
+                harga_idr: { $ref: '#/components/schemas/HargaIdr' }
+      responses:
+        '200':
+          description: Harga baru tercatat di riwayat.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [harga_idr, kurasi_ulang_ringan]
+                properties:
+                  harga_idr: { $ref: '#/components/schemas/HargaIdr' }
+                  kurasi_ulang_ringan: { type: boolean }
+        '401': { $ref: '#/components/responses/Error401' }
+        '404': { $ref: '#/components/responses/Error404' }
+        '422': { $ref: '#/components/responses/Error422' }
+        '500': { $ref: '#/components/responses/Error500' }
+  /web/pesanan-masuk:
+    get:
+      operationId: getWebPesananMasuk
+      tags: [Web Lapak]
+      summary: Sub-pesanan masuk untuk lapak
+      parameters:
+        - { name: status, in: query, schema: { type: string, examples: [DIKONFIRMASI_MENUNGGU] } }
+        - { name: lapak_id, in: query, schema: { type: string } }
+      responses:
+        '200':
+          description: Sub-pesanan.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/SubPesananMasuk' }
+        '401': { $ref: '#/components/responses/Error401' }
+        '500': { $ref: '#/components/responses/Error500' }
+  /web/pesanan-masuk/{sub_id}/konfirmasi:
+    post:
+      operationId: postWebPesananMasukSubIdKonfirmasi
+      tags: [Web Lapak]
+      summary: Terima atau tolak sub-pesanan (maksimal 2 jam jam kerja)
+      description: Tolak setelah bayar memicu refund otomatis via kasir.
+      parameters:
+        - { name: sub_id, in: path, required: true, schema: { type: string } }
+        - { $ref: '#/components/parameters/IdempotencyKey' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [terima]
+              properties:
+                terima: { type: boolean }
+                alasan: { type: string, examples: [stok_rusak] }
+      responses:
+        '200':
+          description: Status baru.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status]
+                properties:
+                  status: { $ref: '#/components/schemas/StatusPesanan' }
+        '401': { $ref: '#/components/responses/Error401' }
+        '404': { $ref: '#/components/responses/Error404' }
+        '409': { $ref: '#/components/responses/Error409' }
+        '422': { $ref: '#/components/responses/Error422' }
+        '500': { $ref: '#/components/responses/Error500' }
+  /web/pesanan-masuk/{sub_id}/serah-trip:
+    post:
+      operationId: postWebPesananMasukSubIdSerahTrip
+      tags: [Web Lapak]
+      summary: Serahkan ke trip Lumbung
+      description: '`kode_serah` wajib cocok dengan pindaian kurir Lumbung; bukti serah menjadi dasar pelepasan escrow.'
+      parameters:
+        - { name: sub_id, in: path, required: true, schema: { type: string } }
+        - { $ref: '#/components/parameters/IdempotencyKey' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [trip_id, kode_serah]
+              properties:
+                trip_id: { type: string, examples: ['TRP-2026-001'] }
+                kode_serah: { type: string }
+      responses:
+        '200':
+          description: DISERAHKAN_KE_TRIP.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status]
+                properties:
+                  status: { type: string, const: DISERAHKAN_KE_TRIP }
+        '401': { $ref: '#/components/responses/Error401' }
+        '404': { $ref: '#/components/responses/Error404' }
+        '409': { $ref: '#/components/responses/Error409' }
+        '422': { $ref: '#/components/responses/Error422' }
+        '500': { $ref: '#/components/responses/Error500' }
+  /web/kurasi/antrean:
+    get:
+      operationId: getWebKurasiAntrean
+      tags: [Web Kurasi]
+      summary: Antrean kurasi (FIFO, prioritas pangan segar)
+      parameters:
+        - name: kategori
+          in: query
+          schema: { $ref: '#/components/schemas/KategoriKode' }
+        - { $ref: '#/components/parameters/Limit' }
+        - { $ref: '#/components/parameters/Cursor' }
+      responses:
+        '200':
+          description: Draf menunggu kurasi.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data, cursor_lanjut]
+                properties:
+                  data:
+                    type: array
+                    items:
+                      type: object
+                      required: [produk_id, judul, umur_antrean_jam, prioritas_pangan_segar]
+                      properties:
+                        produk_id: { type: string }
+                        judul: { type: string }
+                        umur_antrean_jam: { type: integer, minimum: 0 }
+                        prioritas_pangan_segar: { type: boolean }
+                  cursor_lanjut: { type: [string, 'null'] }
+        '401': { $ref: '#/components/responses/Error401' }
+        '500': { $ref: '#/components/responses/Error500' }
+  /web/kurasi/{produk_id}/keputusan:
+    post:
+      operationId: postWebKurasiProdukIdKeputusan
+      tags: [Web Kurasi]
+      summary: Keputusan kurasi (beraudit)
+      parameters:
+        - { name: produk_id, in: path, required: true, schema: { type: string } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [keputusan]
+              properties:
+                keputusan: { type: string, enum: [SETUJU, REVISI, TOLAK] }
+                alasan_baku:
+                  type: string
+                  description: Contoh `FOTO_TIDAK_ASLI`, `HARGA_TIDAK_WAJAR`, `LABEL_KURANG`. Wajib untuk REVISI/TOLAK.
+                catatan: { type: string, maxLength: 280 }
+      responses:
+        '200':
+          description: Status produk terbaru.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status]
+                properties:
+                  status: { $ref: '#/components/schemas/ProdukStatus' }
+        '401': { $ref: '#/components/responses/Error401' }
+        '404': { $ref: '#/components/responses/Error404' }
+        '409': { $ref: '#/components/responses/Error409' }
+        '422': { $ref: '#/components/responses/Error422' }
+        '500': { $ref: '#/components/responses/Error500' }
+  /web/admin/komisi:
+    patch:
+      operationId: patchWebAdminKomisi
+      tags: [Web Admin]
+      summary: Ubah tarif komisi default (hanya admin; diumumkan 14 hari sebelum berlaku)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [tarif_default_persen, berlaku_mulai]
+              properties:
+                tarif_default_persen: { type: integer, minimum: 0, maximum: 100, examples: [8] }
+                berlaku_mulai: { type: string, format: date, examples: ['2026-11-01'] }
+      responses:
+        '200':
+          description: Perubahan tercatat (riwayat tarif append-only).
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [tarif_persen, berlaku_mulai]
+                properties:
+                  tarif_persen: { type: integer }
+                  berlaku_mulai: { type: string, format: date }
+        '401': { $ref: '#/components/responses/Error401' }
+        '422':
+          description: Tanggal berlaku kurang dari 14 hari dari pengumuman atau input tidak valid.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '500': { $ref: '#/components/responses/Error500' }
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: JWT dengan klaim `aud` tepat `pasaree`; akses 15 menit.
+  parameters:
+    IdPath:
+      name: id
+      in: path
+      required: true
+      schema: { type: string }
+    Limit:
+      name: limit
+      in: query
+      schema: { type: integer, minimum: 1, maximum: 50, default: 20 }
+    Cursor:
+      name: cursor
+      in: query
+      schema: { type: string }
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      description: UUID untuk POST mutasi dari web.
+      schema: { type: string, format: uuid }
+  responses:
+    Error400:
+      description: Permintaan tidak valid (`VALIDASI_GAGAL`).
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    Error401:
+      description: Tidak terotentikasi atau token kedaluwarsa / audiens bukan `pasaree` (`AUTH_KEDALUWARSA`).
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    Error404:
+      description: Sumber daya tidak ditemukan (`PESANAN_TIDAK_DITEMUKAN` dan sejenisnya).
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    Error409:
+      description: Konflik status atau data (`STOK_HABIS`, `HARGA_BERUBAH`, `TRIP_PENUH`).
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    Error422:
+      description: Validasi gagal per kolom (`VALIDASI_GAGAL`).
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    Error500:
+      description: Kesalahan server.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+  schemas:
+    Error:
+      type: object
+      description: Respons error baku (`AppError`).
+      required: [kode, pesan]
+      properties:
+        kode:
+          type: string
+          description: Kode baku `VALIDASI_GAGAL`, `AUTH_KEDALUWARSA`, `STOK_HABIS`, `HARGA_BERUBAH`, `TRIP_PENUH`, `PESANAN_TIDAK_DITEMUKAN`, `BATAS_LAJU`.
+          examples: [STOK_HABIS]
+        pesan: { type: string, examples: [Stok varian berubah.] }
+        detail: { type: object, additionalProperties: true }
+    Idr:
+      type: integer
+      description: Uang dalam rupiah, integer tanpa sen.
+      minimum: 0
+      examples: [56000]
+    HargaIdr:
+      type: integer
+      description: Harga varian, integer IDR lebih dari 0 dan kelipatan Rp500.
+      minimum: 500
+      multipleOf: 500
+      examples: [18000]
+    KategoriKode:
+      type: string
+      description: Kategori primer baku (tidak dapat ditambah produsen).
+      enum: [pangan-segar, pangan-olahan, bumbu-dapur, minuman, kerajinan-pangan, paket-hampers]
+    Tag:
+      type: string
+      enum: [pedas, manis, vegan, gluten-free, frozen, siap-saji, kemasan-ulang, edisi-musiman]
+    Satuan:
+      type: string
+      enum: [g, ml, pcs, paket]
+    ProdukStatus:
+      type: string
+      enum: [DRAF, MENUNGGU_KURASI, PERLU_REVISI, TAYANG, NONAKTIF_STOK_0, TAKEDOWN, ARSIP]
+    StatusPesanan:
+      type: string
+      enum: [DRAF_KERANJANG, DIPESAN, DIBAYAR, DIKONFIRMASI_LAPAK, DISERAHKAN_KE_TRIP, DITERIMA_PEMBELI, SELESAI, DIBATALKAN, DIKEMBALIKAN]
+    LoginRequest:
+      type: object
+      required: [email, kata_sandi]
+      properties:
+        email: { type: string, format: email }
+        kata_sandi: { type: string, format: password }
+    RefreshRequest:
+      type: object
+      required: [refresh_token]
+      properties:
+        refresh_token: { type: string }
+    TokenResponse:
+      type: object
+      required: [access_token, refresh_token, expires_in]
+      properties:
+        access_token: { type: string, description: 'JWT `aud: pasaree`, berlaku 15 menit.' }
+        refresh_token: { type: string, description: Berlaku 7 hari; sekali pakai (reuse-detection). }
+        expires_in: { type: integer, examples: [900] }
+    LapakRingkas:
+      type: object
+      required: [slug, nama_lapak]
+      properties:
+        slug: { type: string, examples: [mbok-d] }
+        nama_lapak: { type: string, examples: [Mbok D] }
+    ProdukRingkas:
+      type: object
+      required: [id, judul, kategori_kode, harga_mulai_idr, rating_rata, lapak]
+      properties:
+        id: { type: string, examples: ['01J0000000000000000000002'] }
+        judul: { type: string, examples: [Sambal Bawang Mbok D — 150 g] }
+        kategori_kode: { $ref: '#/components/schemas/KategoriKode' }
+        harga_mulai_idr: { $ref: '#/components/schemas/Idr' }
+        rating_rata: { type: number, minimum: 0, maximum: 5 }
+        lapak: { $ref: '#/components/schemas/LapakRingkas' }
+        media_utama: { type: [string, 'null'], format: uri }
+    VarianProduk:
+      type: object
+      required: [id, nama_varian, sku, harga_idr, stok, satuan, berat_kirim_gram]
+      properties:
+        id: { type: string }
+        produk_id: { type: string }
+        nama_varian: { type: string, minLength: 2, maxLength: 40 }
+        sku: { type: string, minLength: 4, maxLength: 24, description: 'Format `LPK-XXXX-####`.' }
+        harga_idr: { $ref: '#/components/schemas/HargaIdr' }
+        stok: { type: integer, minimum: 0 }
+        satuan: { $ref: '#/components/schemas/Satuan' }
+        berat_kirim_gram: { type: integer, minimum: 1 }
+        tanggal_produksi: { type: [string, 'null'], format: date }
+        kedaluwarsa: { type: [string, 'null'], format: date }
+    MediaProduk:
+      type: object
+      required: [url, jenis, utama]
+      properties:
+        url: { type: string, format: uri }
+        jenis: { type: string, enum: [FOTO, VIDEO] }
+        utama: { type: boolean, description: Tepat satu media utama per produk. }
+        lebar: { type: integer, minimum: 1 }
+        tinggi: { type: integer, minimum: 1 }
+    TripLumbung:
+      type: object
+      required: [trip_id, jadwal_berangkat, ongkir_idr]
+      properties:
+        trip_id: { type: string, examples: ['TRP-2026-001'] }
+        jadwal_berangkat: { type: string, format: date-time }
+        rute: { type: string }
+        titik_serah: { type: string }
+        sisa_kapasitas: { type: integer, minimum: 0 }
+        ongkir_idr: { $ref: '#/components/schemas/Idr' }
+    ProdukTayang:
+      type: object
+      required: [id, judul, kategori_kode, tag, deskripsi, lapak, varian, media, rating_rata, total_ulasan, stok_per_varian, trip_tersedia]
+      properties:
+        id: { type: string }
+        judul: { type: string }
+        kategori_kode: { $ref: '#/components/schemas/KategoriKode' }
+        tag:
+          type: array
+          maxItems: 2
+          items: { $ref: '#/components/schemas/Tag' }
+        deskripsi: { type: string }
+        lapak: { $ref: '#/components/schemas/LapakRingkas' }
+        varian:
+          type: array
+          items: { $ref: '#/components/schemas/VarianProduk' }
+        media:
+          type: array
+          items: { $ref: '#/components/schemas/MediaProduk' }
+        rating_rata: { type: number, minimum: 0, maximum: 5 }
+        total_ulasan: { type: integer, minimum: 0 }
+        stok_per_varian:
+          type: object
+          additionalProperties: { type: integer, minimum: 0 }
+        trip_tersedia:
+          type: array
+          items: { $ref: '#/components/schemas/TripLumbung' }
+        basi: { type: boolean, description: true bila daftar trip berasal dari cache karena Lumbung tidak merespons. }
+    ProfilLapak:
+      type: object
+      required: [slug, nama_lapak, deskripsi, produk, skor_fulfillment_persen]
+      properties:
+        slug: { type: string }
+        nama_lapak: { type: string }
+        deskripsi: { type: string }
+        produk:
+          type: array
+          items: { $ref: '#/components/schemas/ProdukRingkas' }
+        skor_fulfillment_persen:
+          type: integer
+          minimum: 0
+          maximum: 100
+          description: Konfirmasi tepat waktu dalam 90 hari.
+    LapakSaya:
+      type: object
+      required: [id, nama_lapak, slug, status, skor_fulfillment_persen, saldo_tertahan_idr]
+      properties:
+        id: { type: string }
+        nama_lapak: { type: string }
+        slug: { type: string }
+        status: { type: string, enum: [AKTIF, BEKU, TUTUP] }
+        skor_fulfillment_persen: { type: integer, minimum: 0, maximum: 100 }
+        saldo_tertahan_idr: { $ref: '#/components/schemas/Idr' }
+    KeranjangUbah:
+      type: object
+      required: [varian_id, qty]
+      properties:
+        varian_id: { type: string }
+        qty: { type: integer, minimum: 0, description: 0 menghapus item. }
+    Keranjang:
+      type: object
+      required: [item, subtotal_idr, peringatan_stok]
+      properties:
+        item:
+          type: array
+          items:
+            type: object
+            required: [varian_id, qty, harga_idr]
+            properties:
+              varian_id: { type: string }
+              qty: { type: integer, minimum: 1 }
+              harga_idr: { $ref: '#/components/schemas/Idr' }
+        subtotal_idr: { $ref: '#/components/schemas/Idr' }
+        peringatan_stok:
+          type: array
+          items: { type: string }
+    CheckoutRequest:
+      type: object
+      required: [trip_id, titik_id]
+      properties:
+        trip_id: { type: string, examples: ['TRP-2026-001'] }
+        titik_id: { type: string, examples: ['TITIK-05'] }
+        voucher: { type: [string, 'null'] }
+    PratinjauCheckout:
+      type: object
+      required: [subtotal_idr, ongkir_idr, biaya_layanan_idr, total_idr, kunci_stok_hingga, peringatan]
+      properties:
+        subtotal_idr: { $ref: '#/components/schemas/Idr' }
+        ongkir_idr:
+          allOf:
+            - $ref: '#/components/schemas/Idr'
+          description: Dihitung per trip (bukan per lapak); 100% diteruskan ke kas trip Lumbung.
+        biaya_layanan_idr:
+          type: integer
+          const: 2000
+          description: Biaya layanan Rp2.000 per checkout, masuk operasional Pasaree.
+        total_idr:
+          allOf:
+            - $ref: '#/components/schemas/Idr'
+          description: subtotal + ongkir + biaya layanan; komisi lapak tidak termasuk.
+        kunci_stok_hingga: { type: string, format: date-time }
+        peringatan:
+          type: array
+          items: { type: string }
+    PesananBuat:
+      allOf:
+        - $ref: '#/components/schemas/CheckoutRequest'
+        - type: object
+          properties:
+            catatan_per_lapak:
+              type: object
+              additionalProperties: { type: string }
+    BayarRequest:
+      type: object
+      required: [metode, idempotency_key]
+      properties:
+        metode: { type: string, enum: [VA_BCA, QRIS, EWALLET_DANA] }
+        idempotency_key: { type: string, format: uuid }
+    PesananRingkas:
+      type: object
+      required: [id, total_idr, status, dibuat_pada]
+      properties:
+        id: { type: string, examples: ['PSR-01J0000000000000000000001'] }
+        total_idr: { $ref: '#/components/schemas/Idr' }
+        status: { $ref: '#/components/schemas/StatusPesanan' }
+        dibuat_pada: { type: string, format: date-time }
+    PesananDetail:
+      allOf:
+        - $ref: '#/components/schemas/PesananRingkas'
+        - type: object
+          required: [sub_pesanan, timeline, aksi_tersedia]
+          properties:
+            sub_pesanan:
+              type: array
+              items:
+                type: object
+                required: [lapak, status, subtotal_idr]
+                properties:
+                  lapak: { $ref: '#/components/schemas/LapakRingkas' }
+                  status: { $ref: '#/components/schemas/StatusPesanan' }
+                  subtotal_idr: { $ref: '#/components/schemas/Idr' }
+            timeline:
+              type: array
+              items:
+                type: object
+                required: [status, waktu]
+                properties:
+                  status: { $ref: '#/components/schemas/StatusPesanan' }
+                  waktu: { type: string, format: date-time }
+            bukti_serah_trip: { type: [string, 'null'] }
+            escrow_id: { type: [string, 'null'] }
+            aksi_tersedia:
+              type: array
+              items: { type: string, enum: [konfirmasi_terima, ajukan_retur] }
+    UlasanBuat:
+      type: object
+      required: [pesanan_id, produk_id, bintang]
+      properties:
+        pesanan_id: { type: string }
+        produk_id: { type: string }
+        bintang: { type: integer, minimum: 1, maximum: 5 }
+        teks: { type: string }
+        foto_url:
+          type: array
+          items: { type: string, format: uri }
+    DrafProdukPayload:
+      type: object
+      required: [lapak_id, judul, kategori_kode, tag, deskripsi]
+      properties:
+        lapak_id: { type: string }
+        judul: { type: string, minLength: 10, maxLength: 80, description: Wajib memuat berat atau isi. }
+        kategori_kode: { $ref: '#/components/schemas/KategoriKode' }
+        tag:
+          type: array
+          maxItems: 2
+          items: { $ref: '#/components/schemas/Tag' }
+        deskripsi: { type: string, minLength: 50, maxLength: 2000 }
+        komposisi: { type: string }
+        alergen:
+          type: array
+          items: { type: string }
+    CekOtomatis:
+      type: object
+      required: [lolos, kesalahan]
+      properties:
+        lolos: { type: boolean }
+        kesalahan:
+          type: array
+          items:
+            type: object
+            required: [kolom, pesan]
+            properties:
+              kolom: { type: string }
+              pesan: { type: string }
+    SubPesananMasuk:
+      type: object
+      required: [sub_id, pesanan_id, varian, total_idr, batas_konfirmasi_hingga, trip_id]
+      properties:
+        sub_id: { type: string }
+        pesanan_id: { type: string }
+        varian:
+          type: array
+          items:
+            type: object
+            required: [sku, qty]
+            properties:
+              sku: { type: string }
+              qty: { type: integer, minimum: 1 }
+        total_idr: { $ref: '#/components/schemas/Idr' }
+        batas_konfirmasi_hingga: { type: string, format: date-time }
+        trip_id: { type: string }

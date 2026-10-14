@@ -29,3 +29,11 @@ Rujukan utama: [Pasaree-TownHall](https://github.com/Coding-Skuy/Pasaree-TownHal
 2. Salin `.env.example` menjadi `.env` dan isi `DATABASE_URL` basis data `pasaree`.
 3. Jalankan `cargo run`.
 4. Uji sehat: `curl http://localhost:8101/kesehatan`.
+
+## Dokumentasi API
+
+Kontrak OpenAPI 3.1 v1.0.0 ada di `docs/api/openapi.yaml`, ditampilkan dengan Scalar.
+
+- Online (GitHub Pages): https://coding-skuy.github.io/pasaree-backend-service/api/
+- Lokal: `bun x serve docs/api`, lalu buka alamat yang tampil.
+- Perubahan kontrak hanya lewat bump versi + ADR baru di `docs/decisions/`.
